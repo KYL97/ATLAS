@@ -1,0 +1,12 @@
+# Frontend dependencies and build output
+node_modules/
+dist/
+
+# Backend runtime state and local configuration
+backend/.env
+backend/.venv/
+backend/__pycache__/
+backend/atlas.db
+
+# macOS metadata
+.DS_Store
