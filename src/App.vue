@@ -61,6 +61,7 @@ async function doLogin() {
       loginForm.value = { username: '', password: '' }
       loadBrief()
       loadMarkets()
+      loadAssistantHistory()
     } else if (res.status === 401) {
       loginError.value = '用户名或密码错误'
     } else {
@@ -111,6 +112,12 @@ const fallbackMarkets = [
 
 const brief = ref(fallbackBrief)
 const markets = ref(fallbackMarkets)
+const assistantWelcomeMessage = { role: 'assistant', content: '我已读取今日简报和市场快照。' }
+const assistantMessages = ref([assistantWelcomeMessage])
+const assistantDraft = ref('')
+const assistantLoading = ref(false)
+const assistantError = ref('')
+const assistantMessagesEl = ref(null)
 
 // 按当前语言取简报的标题与正文
 const b = computed(() => {
@@ -157,6 +164,22 @@ async function loadMarkets() {
   }
 }
 
+async function loadAssistantHistory() {
+  try {
+    const res = await fetch('/api/assistant/history')
+    if (!res.ok) return
+    const exchanges = await res.json()
+    const messages = exchanges.flatMap(({ question, answer }) => [
+      { role: 'user', content: question },
+      { role: 'assistant', content: answer },
+    ])
+    assistantMessages.value = messages.length ? messages : [assistantWelcomeMessage]
+    scrollAssistantToLatest()
+  } catch (err) {
+    console.warn('助手历史加载失败', err)
+  }
+}
+
 // 「下一篇」：调用 DeepSeek 再生成一篇并展示
 const nextLoading = ref(false)
 async function nextBrief() {
@@ -180,6 +203,39 @@ async function nextBrief() {
   }
 }
 
+async function scrollAssistantToLatest() {
+  await new Promise((resolve) => requestAnimationFrame(resolve))
+  assistantMessagesEl.value?.scrollTo({ top: assistantMessagesEl.value.scrollHeight, behavior: 'smooth' })
+}
+
+async function sendAssistantMessage() {
+  const message = assistantDraft.value.trim()
+  if (!message || assistantLoading.value) return
+
+  const history = assistantMessages.value.slice(-8).map(({ role, content }) => ({ role, content }))
+  assistantMessages.value.push({ role: 'user', content: message })
+  assistantDraft.value = ''
+  assistantError.value = ''
+  assistantLoading.value = true
+  scrollAssistantToLatest()
+
+  try {
+    const res = await fetch('/api/assistant/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, history }),
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || `请求失败（${res.status}）`)
+    assistantMessages.value.push({ role: 'assistant', content: data.reply })
+    scrollAssistantToLatest()
+  } catch (err) {
+    assistantError.value = err.message || 'AI 助手暂时无法响应，请稍后重试'
+  } finally {
+    assistantLoading.value = false
+  }
+}
+
 let refreshTimer = null
 let clockTimer = null
 
@@ -191,6 +247,7 @@ onMounted(() => {
   if (authed.value) {
     loadBrief()
     loadMarkets()
+    loadAssistantHistory()
   }
   // 每 60 秒刷新一次简报与市场快照，与后端定时任务同步
   refreshTimer = window.setInterval(() => {
@@ -262,7 +319,12 @@ function selectNav(label) {
         </button>
       </nav>
 
-      <div class="sidebar-spacer"></div>
+      <section class="assistant-panel" aria-label="ATLAS AI 助手">
+        <div class="assistant-heading"><span class="assistant-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"/><circle cx="12" cy="12" r="4"/></svg></span><div><strong>AI ASSISTANT</strong></div><span class="assistant-online" title="在线"></span></div>
+        <div ref="assistantMessagesEl" class="assistant-messages" aria-live="polite"><div v-for="(item, index) in assistantMessages" :key="index" class="assistant-message" :class="item.role"><span>{{ item.content }}</span></div><div v-if="assistantLoading" class="assistant-typing"><i></i><i></i><i></i></div></div>
+        <div v-if="assistantError" class="assistant-error">{{ assistantError }}</div>
+        <form class="assistant-composer" @submit.prevent="sendAssistantMessage"><textarea v-model="assistantDraft" rows="2" maxlength="2000" placeholder="询问今日情报..." :disabled="assistantLoading" @keydown.enter.exact.prevent="sendAssistantMessage"></textarea><button type="submit" :disabled="!assistantDraft.trim() || assistantLoading" aria-label="发送" title="发送"><svg viewBox="0 0 24 24"><path d="m5 12 14-7-4 14-3.1-5.9L5 12Z"/><path d="m11.9 13.1 3.6-3.6"/></svg></button></form>
+      </section>
       <div class="verified-card">
         <div class="verified-line"><span class="status-dot"></span><strong>今日报告已核验</strong></div>
         <div class="next-label">下一次生成</div><div class="next-time">明日 10:00 CST</div>

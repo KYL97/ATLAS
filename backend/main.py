@@ -19,17 +19,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+from asyncio import to_thread
 from contextlib import asynccontextmanager
 from datetime import date, datetime
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+from volcenginesdkarkruntime import Ark
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas")
@@ -43,6 +45,9 @@ load_dotenv()  # 自动加载同目录下的 .env
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+ARK_API_KEY = os.getenv("ARK_API_KEY", "")
+ARK_BASE_URL = os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+ARK_MODEL = os.getenv("ARK_MODEL", "doubao-seed-evolving")
 
 if not DEEPSEEK_API_KEY:
     logger.warning(
@@ -90,6 +95,15 @@ class MarketItem(SQLModel, table=True):
     status: str
     tone: str = "up"  # up | down
     sort: int = 0
+
+
+class AssistantExchange(SQLModel, table=True):
+    """AI 助手的一轮用户提问与回答记录。"""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    question: str
+    answer: str
+    created_at: datetime = Field(default_factory=datetime.now, index=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -350,12 +364,127 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class AssistantMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class AssistantRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    history: list[AssistantMessage] = Field(default_factory=list, max_length=10)
+
+
 @app.post("/api/login")
 def login(req: LoginRequest) -> dict:
     """校验用户名密码，成功返回令牌。"""
     if req.username == DEMO_USERNAME and req.password == DEMO_PASSWORD:
         return {"token": "atlas-token-admin", "username": req.username}
     raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+
+# --------------------------------------------------------------------------- #
+# ATLAS AI 助手（火山方舟）
+# --------------------------------------------------------------------------- #
+
+def get_assistant_context() -> str:
+    """取当前简报和市场快照，作为助手回答的业务上下文。"""
+    with Session(engine) as session:
+        brief = session.exec(select(Brief).order_by(Brief.brief_date.desc())).first()
+        market_items = session.exec(select(MarketItem).order_by(MarketItem.sort)).all()
+
+    brief_context = "暂无今日简报"
+    if brief:
+        brief_context = (
+            f"日期：{brief.brief_date}\n"
+            f"标题：{brief.headline_zh or brief.headline_en}\n"
+            f"副标题：{brief.subtitle_zh or brief.subtitle_en}\n"
+            f"重点分析：{brief.feature_text_zh or brief.feature_text_en}"
+        )
+    markets_context = "；".join(
+        f"{item.name}（{item.code}）{item.value}，{item.status}" for item in market_items
+    ) or "暂无市场快照"
+    return f"今日简报：\n{brief_context}\n\n市场快照：\n{markets_context}"
+
+
+def extract_ark_text(response: object) -> str:
+    """从 Responses API 返回结构中提取文本，兼容多段输出。"""
+    text_parts: list[str] = []
+    for output in getattr(response, "output", []):
+        if getattr(output, "type", None) != "message":
+            continue
+        for content in getattr(output, "content", []):
+            if getattr(content, "type", None) == "output_text" and getattr(content, "text", None):
+                text_parts.append(content.text)
+    return "\n".join(text_parts).strip()
+
+
+async def ask_ark(req: AssistantRequest) -> str:
+    """在线程中调用同步 Ark SDK，避免阻塞 FastAPI 事件循环。"""
+    if not ARK_API_KEY:
+        raise RuntimeError("缺少 ARK_API_KEY，请在 backend/.env 中配置")
+
+    instructions = (
+        "你是 ATLAS Intelligence Office 的 AI 情报助手。"
+        "优先依据提供的今日简报和市场快照回答，用中文给出清晰、简洁、面向管理者的分析。"
+        "直接给出最终答复，不要输出思考过程，也不要添加“说明”或“最终答案”等标签。"
+        "当上下文没有足够信息时，请明确说明，不要编造实时数据。\n\n"
+        f"{get_assistant_context()}"
+    )
+    messages = [
+        {
+            "role": item.role,
+            "content": [{"type": "input_text", "text": item.content}],
+        }
+        for item in req.history
+    ]
+    messages.append(
+        {"role": "user", "content": [{"type": "input_text", "text": req.message}]}
+    )
+
+    def create_response() -> object:
+        client = Ark(base_url=ARK_BASE_URL, api_key=ARK_API_KEY)
+        return client.responses.create(
+            model=ARK_MODEL,
+            instructions=instructions,
+            input=messages,
+            # 推理模型会先消耗一部分 token 进行内部分析，需保留足够预算生成答复。
+            max_output_tokens=2000,
+            store=False,
+        )
+
+    response = await to_thread(create_response)
+    reply = extract_ark_text(response)
+    if not reply:
+        raise RuntimeError("Ark 未返回可展示的文本")
+    return reply
+
+
+@app.post("/api/assistant/chat")
+async def assistant_chat(req: AssistantRequest) -> dict:
+    """基于今日 ATLAS 情报上下文回答用户问题。"""
+    try:
+        reply = await ask_ark(req)
+        with Session(engine) as session:
+            session.add(AssistantExchange(question=req.message, answer=reply))
+            session.commit()
+        return {"reply": reply}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ark 助手调用失败: %s", exc)
+        raise HTTPException(status_code=502, detail="AI 助手暂时无法响应，请稍后重试") from exc
+
+
+@app.get("/api/assistant/history")
+def assistant_history(limit: int = Query(default=30, ge=1, le=50)) -> list[AssistantExchange]:
+    """返回最近的助手问答记录，按发生时间正序排列。"""
+    with Session(engine) as session:
+        exchanges = session.exec(
+            select(AssistantExchange)
+            .order_by(AssistantExchange.created_at.desc())
+            .limit(limit)
+        ).all()
+    return list(reversed(exchanges))
 
 
 @app.get("/api/brief/today")
