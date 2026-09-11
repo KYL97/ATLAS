@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -540,23 +541,35 @@ async def assistant_chat(req: AssistantRequest) -> StreamingResponse:
         reply_parts: list[str] = []
         try:
             instructions, messages = get_ark_request(req)
-            client = AsyncArk(base_url=ARK_BASE_URL, api_key=ARK_API_KEY)
-            stream = await client.responses.create(
-                model=ARK_MODEL,
-                instructions=instructions,
-                input=messages,
-                reasoning={"effort": "medium"},
-                max_output_tokens=4000,
-                store=False,
-                stream=True,
+            ark_timeout = httpx.Timeout(
+                connect=30.0,
+                read=300.0,
+                write=60.0,
+                pool=60.0,
             )
-            async for event in stream:
-                if getattr(event, "type", None) != "response.output_text.delta":
-                    continue
-                delta = getattr(event, "delta", "")
-                if delta:
-                    reply_parts.append(delta)
-                    yield stream_event("delta", content=delta)
+            async with asyncio.timeout(300):
+                async with AsyncArk(
+                    base_url=ARK_BASE_URL,
+                    api_key=ARK_API_KEY,
+                    timeout=ark_timeout,
+                    max_retries=2,
+                ) as client:
+                    stream = await client.responses.create(
+                        model=ARK_MODEL,
+                        instructions=instructions,
+                        input=messages,
+                        reasoning={"effort": "medium"},
+                        max_output_tokens=4000,
+                        store=False,
+                        stream=True,
+                    )
+                    async for event in stream:
+                        if getattr(event, "type", None) != "response.output_text.delta":
+                            continue
+                        delta = getattr(event, "delta", "")
+                        if delta:
+                            reply_parts.append(delta)
+                            yield stream_event("delta", content=delta)
 
             reply = "".join(reply_parts).strip()
             if not reply:
@@ -570,6 +583,12 @@ async def assistant_chat(req: AssistantRequest) -> StreamingResponse:
                 session.add(stored_exchange)
                 session.commit()
             yield stream_event("done")
+        except TimeoutError:
+            logger.warning("Ark 助手回答超过 300 秒，已终止")
+            yield stream_event("error", message="AI 助手响应超时，请缩短问题或稍后重试")
+        except asyncio.CancelledError:
+            logger.info("AI 助手流式连接已由客户端取消")
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ark 助手流式调用失败: %s", exc)
             yield stream_event("error", message="AI 助手暂时无法响应，请稍后重试")

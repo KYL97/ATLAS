@@ -182,6 +182,8 @@ const assistantLoading = ref(false)
 const assistantThinking = ref(false)
 const assistantError = ref('')
 const assistantMessagesEl = ref(null)
+let assistantAbortController = null
+let assistantTimeoutTimer = null
 
 function formatAssistantContent(content) {
   const escapeHtml = (value) => value
@@ -320,6 +322,10 @@ async function scrollAssistantToLatest() {
   assistantMessagesEl.value?.scrollTo({ top: assistantMessagesEl.value.scrollHeight, behavior: 'smooth' })
 }
 
+function cancelAssistantMessage() {
+  assistantAbortController?.abort()
+}
+
 async function sendAssistantMessage() {
   const message = assistantDraft.value.trim()
   if (!message || assistantLoading.value) return
@@ -331,12 +337,20 @@ async function sendAssistantMessage() {
   assistantThinking.value = true
   scrollAssistantToLatest()
   let stopStreamRenderer = null
+  let requestTimedOut = false
+  const requestController = new AbortController()
+  assistantAbortController = requestController
+  assistantTimeoutTimer = window.setTimeout(() => {
+    requestTimedOut = true
+    requestController.abort()
+  }, 330 * 1000)
 
   try {
     const res = await fetch('/api/assistant/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message }),
+      signal: requestController.signal,
     })
     if (!res.ok || !res.body) throw new Error(`请求失败（${res.status}）`)
 
@@ -395,10 +409,17 @@ async function sendAssistantMessage() {
       throw new Error('AI 助手未返回内容，请稍后重试')
     }
   } catch (err) {
-    assistantError.value = err.message || 'AI 助手暂时无法响应，请稍后重试'
+    if (err?.name === 'AbortError') {
+      assistantError.value = requestTimedOut ? 'AI 助手回复超过 330 秒，已自动取消' : '已取消本次生成'
+    } else {
+      assistantError.value = err.message || 'AI 助手暂时无法响应，请稍后重试'
+    }
   } finally {
     // 确保异常中止时，渲染循环不会继续等待新的网络增量。
     stopStreamRenderer?.()
+    if (assistantTimeoutTimer) window.clearTimeout(assistantTimeoutTimer)
+    if (assistantAbortController === requestController) assistantAbortController = null
+    assistantTimeoutTimer = null
     assistantThinking.value = false
     assistantLoading.value = false
   }
@@ -434,6 +455,8 @@ onUnmounted(() => {
   if (refreshTimer) window.clearInterval(refreshTimer)
   if (clockTimer) window.clearInterval(clockTimer)
   if (weatherTimer) window.clearInterval(weatherTimer)
+  if (assistantTimeoutTimer) window.clearTimeout(assistantTimeoutTimer)
+  assistantAbortController?.abort()
 })
 
 function selectNav(label) {
@@ -494,7 +517,7 @@ function selectNav(label) {
         <div class="assistant-heading"><span class="assistant-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"/><circle cx="12" cy="12" r="4"/></svg></span><div><strong>AI ASSISTANT</strong></div><span class="assistant-online" title="在线"></span></div>
         <div ref="assistantMessagesEl" class="assistant-messages" aria-live="polite"><div v-for="(item, index) in assistantMessages" :key="index" class="assistant-message" :class="item.role"><div v-if="item.role === 'assistant'" class="assistant-rich" v-html="formatAssistantContent(item.content)"></div><span v-else>{{ item.content }}</span></div><div v-if="assistantThinking" class="assistant-thinking" role="status" aria-label="AI 正在思考"><span class="thinking-orb"><i></i><i></i><i></i></span><span class="thinking-label">思考中<span class="thinking-ellipsis">...</span></span></div></div>
         <div v-if="assistantError" class="assistant-error">{{ assistantError }}</div>
-        <form class="assistant-composer" @submit.prevent="sendAssistantMessage"><textarea v-model="assistantDraft" rows="2" maxlength="2000" placeholder="询问今日情报..." :disabled="assistantLoading" @keydown.enter.exact.prevent="sendAssistantMessage"></textarea><button type="submit" :disabled="!assistantDraft.trim() || assistantLoading" aria-label="发送" title="发送"><svg viewBox="0 0 24 24"><path d="m5 12 14-7-4 14-3.1-5.9L5 12Z"/><path d="m11.9 13.1 3.6-3.6"/></svg></button></form>
+        <form class="assistant-composer" @submit.prevent="sendAssistantMessage"><textarea v-model="assistantDraft" rows="2" maxlength="2000" placeholder="询问今日情报..." :disabled="assistantLoading" @keydown.enter.exact.prevent="sendAssistantMessage"></textarea><button v-if="assistantLoading" type="button" class="assistant-cancel" aria-label="取消生成" title="取消生成" @click="cancelAssistantMessage"><svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"/></svg></button><button v-else type="submit" :disabled="!assistantDraft.trim()" aria-label="发送" title="发送"><svg viewBox="0 0 24 24"><path d="m5 12 14-7-4 14-3.1-5.9L5 12Z"/><path d="m11.9 13.1 3.6-3.6"/></svg></button></form>
       </section>
       <div class="verified-card">
         <div class="verified-line"><span class="status-dot"></span><strong>今日报告已核验</strong></div>
