@@ -19,19 +19,19 @@ from __future__ import annotations
 import json
 import logging
 import os
-from asyncio import to_thread
 from contextlib import asynccontextmanager
 from datetime import date, datetime
-from typing import Literal, Optional
+from typing import Optional
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from volcenginesdkarkruntime import Ark
+from volcenginesdkarkruntime import AsyncArk
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas")
@@ -350,6 +350,62 @@ def health() -> dict:
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
 
+@app.get("/api/weather")
+async def weather(
+    lat: float = Query(default=31.2304, ge=-90, le=90),
+    lon: float = Query(default=121.4737, ge=-180, le=180),
+) -> dict:
+    """获取指定坐标的当前天气和当日高低温；默认位置为上海。"""
+    forecast_url = "https://api.open-meteo.com/v1/forecast"
+    forecast_params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,weather_code",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": "auto",
+        "forecast_days": 1,
+    }
+    location_url = "https://api.bigdatacloud.net/data/reverse-geocode-client"
+    location_params = {
+        "latitude": lat,
+        "longitude": lon,
+        "localityLanguage": "zh",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            forecast_response = await client.get(forecast_url, params=forecast_params)
+            forecast_response.raise_for_status()
+            forecast = forecast_response.json()
+
+            location_name = "当前位置"
+            try:
+                location_response = await client.get(location_url, params=location_params)
+                location_response.raise_for_status()
+                location = location_response.json()
+                location_name = (
+                    location.get("city")
+                    or location.get("locality")
+                    or location.get("principalSubdivision")
+                    or location_name
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("天气位置名称获取失败: %s", exc)
+
+        current = forecast.get("current", {})
+        daily = forecast.get("daily", {})
+        return {
+            "location": location_name,
+            "temperature": round(float(current["temperature_2m"])),
+            "weather_code": int(current["weather_code"]),
+            "temperature_max": round(float(daily["temperature_2m_max"][0])),
+            "temperature_min": round(float(daily["temperature_2m_min"][0])),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("天气数据获取失败: %s", exc)
+        raise HTTPException(status_code=502, detail="天气数据暂时无法获取") from exc
+
+
 # --------------------------------------------------------------------------- #
 # 登录（演示：仅支持 admin / 123）
 # --------------------------------------------------------------------------- #
@@ -364,14 +420,8 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class AssistantMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=4000)
-
-
 class AssistantRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
-    history: list[AssistantMessage] = Field(default_factory=list, max_length=10)
 
 
 @app.post("/api/login")
@@ -406,6 +456,33 @@ def get_assistant_context() -> str:
     return f"今日简报：\n{brief_context}\n\n市场快照：\n{markets_context}"
 
 
+def get_assistant_history(limit: int = 4) -> list[dict[str, object]]:
+    """从数据库读取最近已完成的问答，组装成 Ark 的连续对话消息。"""
+    with Session(engine) as session:
+        exchanges = session.exec(
+            select(AssistantExchange)
+            .where(AssistantExchange.answer != "")
+            .order_by(AssistantExchange.created_at.desc())
+            .limit(limit)
+        ).all()
+
+    messages: list[dict[str, object]] = []
+    for exchange in reversed(exchanges):
+        messages.extend(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": exchange.question}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": exchange.answer}],
+                },
+            ]
+        )
+    return messages
+
+
 def extract_ark_text(response: object) -> str:
     """从 Responses API 返回结构中提取文本，兼容多段输出。"""
     text_parts: list[str] = []
@@ -415,11 +492,18 @@ def extract_ark_text(response: object) -> str:
         for content in getattr(output, "content", []):
             if getattr(content, "type", None) == "output_text" and getattr(content, "text", None):
                 text_parts.append(content.text)
+    if not text_parts:
+        # 兼容 SDK 在顶层暴露的快捷文本字段。
+        for field_name in ("output_text", "text"):
+            value = getattr(response, field_name, None)
+            if isinstance(value, str) and value.strip():
+                text_parts.append(value)
+                break
     return "\n".join(text_parts).strip()
 
 
-async def ask_ark(req: AssistantRequest) -> str:
-    """在线程中调用同步 Ark SDK，避免阻塞 FastAPI 事件循环。"""
+def get_ark_request(req: AssistantRequest) -> tuple[str, list[dict[str, object]]]:
+    """组装 Ark 系统指令和包含数据库历史的连续对话消息。"""
     if not ARK_API_KEY:
         raise RuntimeError("缺少 ARK_API_KEY，请在 backend/.env 中配置")
 
@@ -427,52 +511,74 @@ async def ask_ark(req: AssistantRequest) -> str:
         "你是 ATLAS Intelligence Office 的 AI 情报助手。"
         "优先依据提供的今日简报和市场快照回答，用中文给出清晰、简洁、面向管理者的分析。"
         "直接给出最终答复，不要输出思考过程，也不要添加“说明”或“最终答案”等标签。"
+        "历史消息与当前问题属于同一段连续对话，请结合之前的提问和回答理解“它、这个、上面”等指代。"
         "当上下文没有足够信息时，请明确说明，不要编造实时数据。\n\n"
         f"{get_assistant_context()}"
     )
-    messages = [
-        {
-            "role": item.role,
-            "content": [{"type": "input_text", "text": item.content}],
-        }
-        for item in req.history
-    ]
+    messages = get_assistant_history()
     messages.append(
         {"role": "user", "content": [{"type": "input_text", "text": req.message}]}
     )
+    return instructions, messages
 
-    def create_response() -> object:
-        client = Ark(base_url=ARK_BASE_URL, api_key=ARK_API_KEY)
-        return client.responses.create(
-            model=ARK_MODEL,
-            instructions=instructions,
-            input=messages,
-            # 推理模型会先消耗一部分 token 进行内部分析，需保留足够预算生成答复。
-            max_output_tokens=2000,
-            store=False,
-        )
 
-    response = await to_thread(create_response)
-    reply = extract_ark_text(response)
-    if not reply:
-        raise RuntimeError("Ark 未返回可展示的文本")
-    return reply
+def stream_event(event_type: str, **payload: object) -> str:
+    """把流事件编码为一行 JSON，便于前端稳定解析中文增量。"""
+    return json.dumps({"type": event_type, **payload}, ensure_ascii=False) + "\n"
 
 
 @app.post("/api/assistant/chat")
-async def assistant_chat(req: AssistantRequest) -> dict:
-    """基于今日 ATLAS 情报上下文回答用户问题。"""
-    try:
-        reply = await ask_ark(req)
-        with Session(engine) as session:
-            session.add(AssistantExchange(question=req.message, answer=reply))
-            session.commit()
-        return {"reply": reply}
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Ark 助手调用失败: %s", exc)
-        raise HTTPException(status_code=502, detail="AI 助手暂时无法响应，请稍后重试") from exc
+async def assistant_chat(req: AssistantRequest) -> StreamingResponse:
+    """先保存问题，再将 Ark 的回答增量流式发送给前端。"""
+    with Session(engine) as session:
+        exchange = AssistantExchange(question=req.message, answer="")
+        session.add(exchange)
+        session.commit()
+        session.refresh(exchange)
+
+    async def generate():
+        reply_parts: list[str] = []
+        try:
+            instructions, messages = get_ark_request(req)
+            client = AsyncArk(base_url=ARK_BASE_URL, api_key=ARK_API_KEY)
+            stream = await client.responses.create(
+                model=ARK_MODEL,
+                instructions=instructions,
+                input=messages,
+                reasoning={"effort": "medium"},
+                max_output_tokens=4000,
+                store=False,
+                stream=True,
+            )
+            async for event in stream:
+                if getattr(event, "type", None) != "response.output_text.delta":
+                    continue
+                delta = getattr(event, "delta", "")
+                if delta:
+                    reply_parts.append(delta)
+                    yield stream_event("delta", content=delta)
+
+            reply = "".join(reply_parts).strip()
+            if not reply:
+                raise RuntimeError("Ark 未返回可展示的文本")
+
+            with Session(engine) as session:
+                stored_exchange = session.get(AssistantExchange, exchange.id)
+                if stored_exchange is None:
+                    raise RuntimeError("问答记录不存在，无法保存 AI 回答")
+                stored_exchange.answer = reply
+                session.add(stored_exchange)
+                session.commit()
+            yield stream_event("done")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ark 助手流式调用失败: %s", exc)
+            yield stream_event("error", message="AI 助手暂时无法响应，请稍后重试")
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/assistant/history")
@@ -481,6 +587,7 @@ def assistant_history(limit: int = Query(default=30, ge=1, le=50)) -> list[Assis
     with Session(engine) as session:
         exchanges = session.exec(
             select(AssistantExchange)
+            .where(AssistantExchange.answer != "")
             .order_by(AssistantExchange.created_at.desc())
             .limit(limit)
         ).all()

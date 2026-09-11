@@ -32,6 +32,68 @@ const currentDate = computed(() => {
 })
 const currentMarketTime = computed(() => `约 ${timeFormatter.format(now.value)} CST`)
 
+const weather = ref({
+  location: '上海',
+  temperature: null,
+  temperature_max: null,
+  temperature_min: null,
+  weather_code: 0,
+})
+const weatherLoading = ref(true)
+
+const weatherMeta = computed(() => {
+  const code = weather.value.weather_code
+  if (code === 0) return { label: '晴', icon: 'sun' }
+  if ([1, 2].includes(code)) return { label: '晴间多云', icon: 'partly' }
+  if (code === 3) return { label: '多云', icon: 'cloud' }
+  if ([45, 48].includes(code)) return { label: '雾', icon: 'fog' }
+  if ([51, 53, 55, 56, 57].includes(code)) return { label: '小雨', icon: 'rain' }
+  if ([61, 63, 65, 66, 67, 80, 81, 82].includes(code)) return { label: '雨', icon: 'rain' }
+  if ([71, 73, 75, 77, 85, 86].includes(code)) return { label: '雪', icon: 'snow' }
+  if ([95, 96, 99].includes(code)) return { label: '雷雨', icon: 'storm' }
+  return { label: '天气变化', icon: 'cloud' }
+})
+
+function getBrowserPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject(new Error('浏览器不支持定位'))
+    navigator.geolocation.getCurrentPosition(resolve, reject, {
+      enableHighAccuracy: false,
+      timeout: 6000,
+      maximumAge: 30 * 60 * 1000,
+    })
+  })
+}
+
+async function loadWeather() {
+  weatherLoading.value = true
+  const requestWeather = async (coordinates) => {
+    const params = new URLSearchParams({
+      lat: coordinates.latitude.toFixed(4),
+      lon: coordinates.longitude.toFixed(4),
+    })
+    const res = await fetch(`/api/weather?${params}`)
+    if (!res.ok) throw new Error(`天气请求失败（${res.status}）`)
+    weather.value = await res.json()
+  }
+
+  try {
+    // 先展示默认城市，定位结果到达后再更新，避免权限等待期间一直显示占位符。
+    await requestWeather({ latitude: 31.2304, longitude: 121.4737 })
+  } catch (err) {
+    console.warn('天气数据加载失败', err)
+  } finally {
+    weatherLoading.value = false
+  }
+
+  try {
+    const position = await getBrowserPosition()
+    await requestWeather(position.coords)
+  } catch (err) {
+    console.info('定位不可用，天气使用上海作为回退位置')
+  }
+}
+
 function toast(msg) {
   toastMsg.value = msg
   showToast.value = true
@@ -62,6 +124,7 @@ async function doLogin() {
       loadBrief()
       loadMarkets()
       loadAssistantHistory()
+      loadWeather()
     } else if (res.status === 401) {
       loginError.value = '用户名或密码错误'
     } else {
@@ -80,7 +143,7 @@ function logout() {
 }
 
 const navItems = [
-  { label: '今日简报', en: 'Daily Brief', icon: 'target' },
+  { label: '今日简报', en: 'Daily Brief' },
 ]
 
 // 内置回退数据：后端不可用时仍能展示（中英双语）
@@ -116,8 +179,57 @@ const assistantWelcomeMessage = { role: 'assistant', content: '我已读取今�
 const assistantMessages = ref([assistantWelcomeMessage])
 const assistantDraft = ref('')
 const assistantLoading = ref(false)
+const assistantThinking = ref(false)
 const assistantError = ref('')
 const assistantMessagesEl = ref(null)
+
+function formatAssistantContent(content) {
+  const escapeHtml = (value) => value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+  const inline = (value) => value
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/__(.+?)__/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+  const lines = escapeHtml(String(content || '')).split(/\r?\n/)
+  const html = []
+  let listType = null
+
+  const closeList = () => {
+    if (listType) {
+      html.push(`</${listType}>`)
+      listType = null
+    }
+  }
+
+  for (const line of lines) {
+    const heading = line.match(/^\s{0,3}#{1,3}\s+(.+)$/)
+    const bullet = line.match(/^\s*[-*]\s+(.+)$/)
+    const numbered = line.match(/^\s*\d+[.)]\s+(.+)$/)
+    if (!line.trim()) {
+      closeList()
+    } else if (heading) {
+      closeList()
+      html.push(`<h4>${inline(heading[1])}</h4>`)
+    } else if (bullet || numbered) {
+      const nextType = bullet ? 'ul' : 'ol'
+      if (listType !== nextType) {
+        closeList()
+        listType = nextType
+        html.push(`<${listType}>`)
+      }
+      html.push(`<li>${inline((bullet || numbered)[1])}</li>`)
+    } else {
+      closeList()
+      html.push(`<p>${inline(line)}</p>`)
+    }
+  }
+  closeList()
+  return html.join('')
+}
 
 // 按当前语言取简报的标题与正文
 const b = computed(() => {
@@ -212,32 +324,89 @@ async function sendAssistantMessage() {
   const message = assistantDraft.value.trim()
   if (!message || assistantLoading.value) return
 
-  const history = assistantMessages.value.slice(-8).map(({ role, content }) => ({ role, content }))
   assistantMessages.value.push({ role: 'user', content: message })
   assistantDraft.value = ''
   assistantError.value = ''
   assistantLoading.value = true
+  assistantThinking.value = true
   scrollAssistantToLatest()
+  let stopStreamRenderer = null
 
   try {
     const res = await fetch('/api/assistant/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, history }),
+      body: JSON.stringify({ message }),
     })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.detail || `请求失败（${res.status}）`)
-    assistantMessages.value.push({ role: 'assistant', content: data.reply })
-    scrollAssistantToLatest()
+    if (!res.ok || !res.body) throw new Error(`请求失败（${res.status}）`)
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let replyIndex = -1
+    let pendingText = ''
+    let streamFinished = false
+    let renderPromise = null
+    stopStreamRenderer = () => { streamFinished = true }
+
+    const renderQueuedText = async () => {
+      while (!streamFinished || pendingText) {
+        if (!pendingText) {
+          await new Promise((resolve) => window.setTimeout(resolve, 16))
+          continue
+        }
+        // 网络增量可能集中到达；按队列长度动态取字，保持可见且不过度拖慢的流式效果。
+        const size = Math.min(16, Math.max(2, Math.ceil(pendingText.length / 40)))
+        assistantMessages.value[replyIndex].content += pendingText.slice(0, size)
+        pendingText = pendingText.slice(size)
+        scrollAssistantToLatest()
+        await new Promise((resolve) => window.setTimeout(resolve, 20))
+      }
+    }
+
+    const handleLine = (line) => {
+      if (!line.trim()) return
+      const event = JSON.parse(line)
+      if (event.type === 'delta') {
+        if (replyIndex < 0) {
+          assistantThinking.value = false
+          assistantMessages.value.push({ role: 'assistant', content: '' })
+          replyIndex = assistantMessages.value.length - 1
+          renderPromise = renderQueuedText()
+        }
+        pendingText += event.content
+      } else if (event.type === 'error') {
+        throw new Error(event.message || 'AI 助手暂时无法响应，请稍后重试')
+      }
+    }
+
+    while (true) {
+      const { value, done } = await reader.read()
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      for (const line of lines) handleLine(line)
+      if (done) break
+    }
+    if (buffer) handleLine(buffer)
+    streamFinished = true
+    if (renderPromise) await renderPromise
+    if (replyIndex < 0 || !assistantMessages.value[replyIndex]?.content) {
+      throw new Error('AI 助手未返回内容，请稍后重试')
+    }
   } catch (err) {
     assistantError.value = err.message || 'AI 助手暂时无法响应，请稍后重试'
   } finally {
+    // 确保异常中止时，渲染循环不会继续等待新的网络增量。
+    stopStreamRenderer?.()
+    assistantThinking.value = false
     assistantLoading.value = false
   }
 }
 
 let refreshTimer = null
 let clockTimer = null
+let weatherTimer = null
 
 onMounted(() => {
   // 页面时钟每秒更新，确保日期跨天时也能及时切换
@@ -248,6 +417,7 @@ onMounted(() => {
     loadBrief()
     loadMarkets()
     loadAssistantHistory()
+    loadWeather()
   }
   // 每 60 秒刷新一次简报与市场快照，与后端定时任务同步
   refreshTimer = window.setInterval(() => {
@@ -255,11 +425,15 @@ onMounted(() => {
     loadBrief()
     loadMarkets()
   }, 60000)
+  weatherTimer = window.setInterval(() => {
+    if (authed.value) loadWeather()
+  }, 30 * 60 * 1000)
 })
 
 onUnmounted(() => {
   if (refreshTimer) window.clearInterval(refreshTimer)
   if (clockTimer) window.clearInterval(clockTimer)
+  if (weatherTimer) window.clearInterval(weatherTimer)
 })
 
 function selectNav(label) {
@@ -303,25 +477,22 @@ function selectNav(label) {
         <div><div class="brand-title">ATLAS</div><div class="brand-subtitle">INTELLIGENCE OFFICE</div></div>
       </div>
 
-      <div class="eyebrow sidebar-label">INTELLIGENCE DESK</div>
-      <nav class="nav-list">
-        <button v-for="item in navItems" :key="item.label" class="nav-item" :class="{ active: activeNav === item.label }" @click="selectNav(item.label)">
-          <span class="nav-icon" aria-hidden="true">
-            <svg v-if="item.icon === 'target'" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><circle cx="11" cy="11" r="2"/><path d="m16 16 4 4M11 4v2M4 11h2"/></svg>
-            <svg v-else-if="item.icon === 'globe'" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.8 9h16.4M3.8 15h16.4M12 3.5c2.2 2.3 3.3 5.1 3.3 8.5s-1.1 6.2-3.3 8.5c-2.2-2.3-3.3-5.1-3.3-8.5S9.8 5.8 12 3.5Z"/></svg>
-            <svg v-else-if="item.icon === 'building'" viewBox="0 0 24 24"><path d="M4 20h16M6 20V8h12v12M4 8h16M8 5h8M10 11v2M14 11v2M10 16v2M14 16v2"/></svg>
-            <svg v-else-if="item.icon === 'compass'" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="m15 9-2 5-5 2 2-5 5-2Z"/></svg>
-            <svg v-else-if="item.icon === 'spark'" viewBox="0 0 24 24"><path d="m12 3 1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6L12 3ZM19 16l.7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z"/></svg>
-            <svg v-else-if="item.icon === 'shield'" viewBox="0 0 24 24"><path d="M12 3 19 6v5.2c0 4.6-2.8 7.9-7 9.8-4.2-1.9-7-5.2-7-9.8V6l7-3Z"/><path d="M12 8v4M12 15h.01"/></svg>
-            <svg v-else viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg>
-          </span>
-          <span class="nav-copy"><strong>{{ item.label }}</strong><small>{{ item.en }}</small></span><span class="nav-arrow">›</span>
-        </button>
-      </nav>
+      <section class="weather-card" aria-label="所在地天气">
+        <div class="weather-icon" :class="`weather-${weatherMeta.icon}`" aria-hidden="true">
+          <svg v-if="weatherMeta.icon === 'sun'" viewBox="0 0 32 32"><circle cx="16" cy="16" r="5"/><path d="M16 3v4M16 25v4M3 16h4M25 16h4M6.8 6.8l2.8 2.8M22.4 22.4l2.8 2.8M25.2 6.8l-2.8 2.8M9.6 22.4l-2.8 2.8"/></svg>
+          <svg v-else-if="weatherMeta.icon === 'partly'" viewBox="0 0 32 32"><circle cx="12" cy="11" r="5"/><path d="M12 3v2M4 11h2M6.3 5.3l1.4 1.4M20 11h2M17.7 5.3l-1.4 1.4"/><path d="M9 24h15a5 5 0 0 0-1-9.9A7 7 0 0 0 9.5 16 4 4 0 0 0 9 24Z"/></svg>
+          <svg v-else-if="weatherMeta.icon === 'rain'" viewBox="0 0 32 32"><path d="M7 21h17a5 5 0 0 0-1-9.9A8 8 0 0 0 7.8 13 4 4 0 0 0 7 21Z"/><path d="m11 24-1 3M17 24l-1 3M23 24l-1 3"/></svg>
+          <svg v-else-if="weatherMeta.icon === 'snow'" viewBox="0 0 32 32"><path d="M7 19h17a5 5 0 0 0-1-9.9A8 8 0 0 0 7.8 11 4 4 0 0 0 7 19Z"/><path d="M11 24h.01M17 26h.01M23 24h.01"/></svg>
+          <svg v-else-if="weatherMeta.icon === 'storm'" viewBox="0 0 32 32"><path d="M7 19h17a5 5 0 0 0-1-9.9A8 8 0 0 0 7.8 11 4 4 0 0 0 7 19Z"/><path d="m17 20-3 5h3l-2 4 6-7h-3l2-2"/></svg>
+          <svg v-else-if="weatherMeta.icon === 'fog'" viewBox="0 0 32 32"><path d="M6 11h20M4 16h22M7 21h19"/></svg>
+          <svg v-else viewBox="0 0 32 32"><path d="M7 23h17a5 5 0 0 0-1-9.9A8 8 0 0 0 7.8 15 4 4 0 0 0 7 23Z"/></svg>
+        </div>
+        <div class="weather-copy"><span class="weather-location">{{ weather.location }}</span><strong>{{ weatherLoading && weather.temperature === null ? '--' : weather.temperature }}°</strong><small>{{ weatherMeta.label }} · 最高 {{ weather.temperature_max ?? '--' }}° / 最低 {{ weather.temperature_min ?? '--' }}°</small></div>
+      </section>
 
       <section class="assistant-panel" aria-label="ATLAS AI 助手">
         <div class="assistant-heading"><span class="assistant-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"/><circle cx="12" cy="12" r="4"/></svg></span><div><strong>AI ASSISTANT</strong></div><span class="assistant-online" title="在线"></span></div>
-        <div ref="assistantMessagesEl" class="assistant-messages" aria-live="polite"><div v-for="(item, index) in assistantMessages" :key="index" class="assistant-message" :class="item.role"><span>{{ item.content }}</span></div><div v-if="assistantLoading" class="assistant-typing"><i></i><i></i><i></i></div></div>
+        <div ref="assistantMessagesEl" class="assistant-messages" aria-live="polite"><div v-for="(item, index) in assistantMessages" :key="index" class="assistant-message" :class="item.role"><div v-if="item.role === 'assistant'" class="assistant-rich" v-html="formatAssistantContent(item.content)"></div><span v-else>{{ item.content }}</span></div><div v-if="assistantThinking" class="assistant-thinking" role="status" aria-label="AI 正在思考"><span class="thinking-orb"><i></i><i></i><i></i></span><span class="thinking-label">思考中<span class="thinking-ellipsis">...</span></span></div></div>
         <div v-if="assistantError" class="assistant-error">{{ assistantError }}</div>
         <form class="assistant-composer" @submit.prevent="sendAssistantMessage"><textarea v-model="assistantDraft" rows="2" maxlength="2000" placeholder="询问今日情报..." :disabled="assistantLoading" @keydown.enter.exact.prevent="sendAssistantMessage"></textarea><button type="submit" :disabled="!assistantDraft.trim() || assistantLoading" aria-label="发送" title="发送"><svg viewBox="0 0 24 24"><path d="m5 12 14-7-4 14-3.1-5.9L5 12Z"/><path d="m11.9 13.1 3.6-3.6"/></svg></button></form>
       </section>
@@ -337,6 +508,14 @@ function selectNav(label) {
         <div class="search-box"><svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><input v-model="search" placeholder="搜索主题、国家、行业或公司..."/><kbd>⌘ K</kbd></div>
         <div class="top-actions"><div class="lang-switch" role="group" aria-label="语言切换"><button :class="{ active: lang === 'zh' }" @click="setLang('zh')">中</button><button :class="{ active: lang === 'en' }" @click="setLang('en')">EN</button></div><span class="top-divider"></span><button class="icon-button" aria-label="通知"><svg viewBox="0 0 24 24"><path d="M6 17h12l-1.2-1.8V10a4.8 4.8 0 0 0-9.6 0v5.2L6 17ZM10 20h4"/></svg></button><span class="top-divider"></span><div class="date"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.3"/><path d="M12 7v5l3 2"/></svg><span>{{ currentDate }}</span></div><div class="avatar">SW</div><button class="logout-btn" @click="logout" aria-label="退出登录" title="退出登录"><svg viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l-5-5 5-5M5 12h11"/></svg></button></div>
       </header>
+
+      <nav class="module-nav" aria-label="情报板块导航">
+        <div class="module-nav-list">
+          <button v-for="item in navItems" :key="item.label" class="module-nav-item" :class="{ active: activeNav === item.label }" @click="selectNav(item.label)">
+            <span class="module-nav-copy"><strong>{{ item.label }}</strong><small>{{ item.en }}</small></span>
+          </button>
+        </div>
+      </nav>
 
       <div class="page-wrap">
         <section class="hero">
