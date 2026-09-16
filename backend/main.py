@@ -49,6 +49,12 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 ARK_API_KEY = os.getenv("ARK_API_KEY", "")
 ARK_BASE_URL = os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 ARK_MODEL = os.getenv("ARK_MODEL", "doubao-seed-evolving")
+ARK_WEB_SEARCH_TOOL = {
+    "type": "web_search",
+    "sources": ["search_engine"],
+    "limit": 5,
+    "max_keyword": 3,
+}
 
 if not DEEPSEEK_API_KEY:
     logger.warning(
@@ -105,6 +111,10 @@ class AssistantExchange(SQLModel, table=True):
     question: str
     answer: str
     created_at: datetime = Field(default_factory=datetime.now, index=True)
+
+
+class ArkWebSearchUnavailableError(RuntimeError):
+    """火山方舟账号尚未开通联网搜索。"""
 
 
 # --------------------------------------------------------------------------- #
@@ -513,7 +523,8 @@ def get_ark_request(req: AssistantRequest) -> tuple[str, list[dict[str, object]]
         "优先依据提供的今日简报和市场快照回答，用中文给出清晰、简洁、面向管理者的分析。"
         "直接给出最终答复，不要输出思考过程，也不要添加“说明”或“最终答案”等标签。"
         "历史消息与当前问题属于同一段连续对话，请结合之前的提问和回答理解“它、这个、上面”等指代。"
-        "当上下文没有足够信息时，请明确说明，不要编造实时数据。\n\n"
+        "涉及最新、当前、实时、突发事件或需要外部事实核验的问题时，优先使用联网搜索。"
+        "引用联网信息时请注明来源及信息日期；无法通过可靠来源核实时，请明确说明，不要编造实时数据。\n\n"
         f"{get_assistant_context()}"
     )
     messages = get_assistant_history()
@@ -560,11 +571,20 @@ async def assistant_chat(req: AssistantRequest) -> StreamingResponse:
                         input=messages,
                         reasoning={"effort": "medium"},
                         max_output_tokens=4000,
+                        tools=[ARK_WEB_SEARCH_TOOL],
+                        tool_choice="auto",
                         store=False,
                         stream=True,
                     )
                     async for event in stream:
-                        if getattr(event, "type", None) != "response.output_text.delta":
+                        event_type = getattr(event, "type", None)
+                        if event_type == "error":
+                            if getattr(event, "code", None) == "ToolNotOpen":
+                                raise ArkWebSearchUnavailableError
+                            raise RuntimeError(
+                                getattr(event, "message", "Ark 流式响应失败")
+                            )
+                        if event_type != "response.output_text.delta":
                             continue
                         delta = getattr(event, "delta", "")
                         if delta:
@@ -586,6 +606,12 @@ async def assistant_chat(req: AssistantRequest) -> StreamingResponse:
         except TimeoutError:
             logger.warning("Ark 助手回答超过 300 秒，已终止")
             yield stream_event("error", message="AI 助手响应超时，请缩短问题或稍后重试")
+        except ArkWebSearchUnavailableError:
+            logger.warning("火山方舟账号尚未开通联网搜索")
+            yield stream_event(
+                "error",
+                message="联网搜索尚未在火山方舟账号中开通，请先在控制台开通后重试",
+            )
         except asyncio.CancelledError:
             logger.info("AI 助手流式连接已由客户端取消")
             raise
